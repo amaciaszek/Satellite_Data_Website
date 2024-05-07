@@ -1,0 +1,573 @@
+---
+title: "Satellite Data"
+output: 
+  rmarkdown::html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: darkly
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(leaflet)
+library(dplyr)
+library(RColorBrewer)
+library(IRdisplay)
+library(ggimage)
+library(tidyverse)
+library(ggflags)
+library(plotly)
+library(countrycode)
+library(tidytext)
+library(scico)
+library(tidyr)
+library(readxl)
+library(forcats) 
+library(patchwork)
+
+# Read data from CSV and perform initial processing
+all_space <- read.csv("nasaAPI.csv")
+all_space$launchyear <- as.numeric(substr(all_space$LAUNCH, 1, 4))
+all_space$launchmonth <- as.numeric(substr(all_space$LAUNCH, 6, 7))
+all_space$launchday <- as.numeric(substr(all_space$LAUNCH, 9, 10))
+all_space$launchyearmonth <- paste(substr(all_space$LAUNCH, 1, 7), "-01", sep = '')
+all_space$LAUNCH <- as.Date(all_space$LAUNCH)
+all_space$DECAY <- as.Date(all_space$DECAY)
+all_space$launchyearmonth <- as.Date(all_space$launchyearmonth)
+
+# Define helper function
+timeorbit <- function(a, b) {
+  b <- ifelse(is.na(b), Sys.Date(), b)
+  as.numeric(difftime(b, a, units = "days"))
+}
+
+# Apply timeorbit function and filter payload objects
+all_space$TimeOrbit <- mapply(timeorbit, all_space$LAUNCH, all_space$DECAY)
+all_sat <- filter(all_space, OBJECT_TYPE == "PAYLOAD")
+
+# Read Excel data and clean up
+satellite_data <- read_excel("UCS-Satellite-Database 5-1-2023.xlsx")
+all_na_columns <- colSums(is.na(satellite_data)) == nrow(satellite_data)
+columns_to_keep <- !all_na_columns
+cleaned_data <- satellite_data[, columns_to_keep]  # This step seems unused, consider removing
+satellite_data$Comments <- paste(satellite_data$Comments, satellite_data$...29, sep = " ")
+satellite_data <- satellite_data[, -which(names(satellite_data) == "...29")]
+
+# Consolidate web source columns
+web_source_columns <- grep("^Source|^\\.\\.\\.", names(satellite_data))
+satellite_data$Web_Sources <- apply(satellite_data[, web_source_columns], 1, 
+                                    function(x) paste(trimws(x, "both"), collapse = " "))
+satellite_data <- satellite_data[, -web_source_columns]
+satellite_data$Web_Sources <- gsub("\\bNA\\b", "", satellite_data$Web_Sources)
+satellite_data$Web_Sources <- trimws(satellite_data$Web_Sources)
+satellite_data$Web_Sources <- gsub("\\s+", " ", satellite_data$Web_Sources)
+
+convert_excel_serial_date <- function(excel_serial_date) {
+    # Convert to numeric, handling NA or non-numeric values
+    numeric_date <- as.numeric(excel_serial_date)
+    if (anyNA(numeric_date) || any(!is.numeric(numeric_date))) {
+        if (anyNA(numeric_date)){standard_date <- NA}
+        else{
+        excel_serial_date <- gsub("//", "/", excel_serial_date)
+        excel_serial_date <- strsplit(excel_serial_date,split = '/')
+        excel_serial_date <- as.numeric(excel_serial_date[[1]])
+        if (excel_serial_date[3]<50){
+            excel_serial_date[3] <- excel_serial_date[3]+2000
+        }
+        excel_serial_date <- excel_serial_date[c(3, 1, 2)]
+        standard_date <- paste(excel_serial_date, collapse = "-")}
+    }
+    standard_date <- as.Date("1899-12-30") + numeric_date - 1
+    return(standard_date)
+}
+
+head(satellite_data$`Date of Launch`)
+newlist <- c()
+index <-2
+for (date in satellite_data$`Date of Launch`) {
+    convert_excel_serial_date(date)
+    index <- index +1
+}
+satellite_data$`Date of Launch` <- convert_excel_serial_date(satellite_data$`Date of Launch`)
+satellite_data$Launch_Year <- as.numeric(format(satellite_data$'Date of Launch', "%Y"))
+satellite_data$Launch_Month <- as.numeric(format(satellite_data$'Date of Launch', "%m"))
+satellite_data$Launch_Day <- as.numeric(format(satellite_data$'Date of Launch', "%d"))
+
+                                 
+head(satellite_data$Launch_Year)
+
+# Merge the two datasets
+merged_data <- merge(all_sat, satellite_data, by.x = "NORAD_CAT_ID", by.y = "NORAD Number", all = TRUE)
+write.csv(merged_data, "merged_data0.csv", row.names = FALSE)
+
+launches <- read.csv("launches.csv")
+
+# Initialize columns for Year, Month, and Day
+launches$Year <- NA
+launches$Month <- NA
+launches$Day <- NA
+
+# Loop through the 'Net' column to extract date components
+for (i in seq_along(launches$Net)) {
+    date_parts <- strsplit(launches$Net[i], " ")[[1]][1]
+    date_components <- as.numeric(strsplit(date_parts, '/')[[1]])
+    
+    # Assign the extracted components to the respective columns
+    if (length(date_components) == 3) {
+        launches$Year[i] <- date_components[3]
+        launches$Month[i] <- date_components[1]
+        launches$Day[i] <- date_components[2]
+    }
+}
+
+# Filter out rows where Status is not 'TBA'
+launches <- subset(launches, Status != "TBA")
+                                    
+merged_data <- merge(merged_data, launches, by.x = c("launchyear", "launchmonth", "launchday"), by.y = c("Year", "Month", "Day"), all.x = TRUE)
+```
+
+## Data Visualizations {.tabset}
+
+### Number of Payloads Launched into Orbit by Year (1957-2023)
+```{r, echo=FALSE}
+merged_data$launchyear <- suppressWarnings(as.numeric(merged_data$launchyear))
+
+# Filter data to exclude years >= 2024 and remove non-numeric/missing launch years
+filtered_data <- merged_data[!is.na(merged_data$launchyear) & merged_data$launchyear < 2024, ]
+
+# Define colors using RColorBrewer
+colors <- brewer.pal(5, "Blues")[c(3, 4)]  # Selecting shades of blue
+
+# Create ggplot object
+p <- ggplot(filtered_data, aes(x = launchyear)) +
+  geom_histogram(binwidth = 1, fill = colors[1], color = colors[2]) +
+  labs(
+    x = "Year Launched",
+    y = "Number of Payloads per Year",
+    caption = "\nCounts include both deorbited and in-orbit payloads, mostly satellites\nThis data was collected through www.space-track.org API"
+  ) +
+  scale_x_continuous(breaks = seq(1955, 2025, by = 5), expand = c(0, 0)) +
+  scale_fill_brewer(type = "seq", palette = "Blues") +
+  scale_y_continuous(breaks = seq(0, 3600, by = 400)) +
+  theme_dark() +  # Set dark theme
+  theme(
+    plot.background = element_rect(fill = "black"),  # Change background to black
+    text = element_text(color = "white"),  # Change text color to white
+    axis.line = element_line(color = "white"),  # Set axis line color to white
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    plot.title = element_blank(),  # Remove plot title
+    plot.margin = unit(c(1, 1, 0, 1), "lines")  # Adjust plot margins as needed
+  )
+
+# Convert ggplot object to plotly
+ggplotly(p)
+```
+
+**Description:**
+This dataset encompasses counts of both deorbited and in-orbit payloads, predominantly satellites, including parts and supplies for all space stations. The data, sourced from the www.space-track.org API, spans the years 1957 to 2023.
+
+
+### Top 10 Countries by Most Payloads Launched into Orbit
+```{r, echo=FALSE}
+filtered_data <- merged_data %>% filter(as.numeric(launchyear) < 2024)
+
+# Calculate the count of payloads for each country
+payload_counts <- filtered_data %>% 
+  group_by(COUNTRY) %>% 
+  summarise(Count = n()) %>%
+  ungroup() %>%
+  mutate(COUNTRY = case_when(
+    COUNTRY == "CIS" ~ "RU",
+    COUNTRY == "PRC" ~ "CN",
+    COUNTRY == "GER" ~ "DE",
+    COUNTRY == "CAN" ~ "CA",
+    COUNTRY == "FRA" ~ "FR",
+    COUNTRY == "US" ~ "US",
+    COUNTRY == "JPN" ~ "JP",
+    COUNTRY == "IND" ~ "IN",
+    COUNTRY == "UK" ~ "GB",
+    COUNTRY == "ESA" ~ "EU",
+    TRUE ~ COUNTRY
+  ))
+
+# Select the top 10 countries by payload count
+top_10_payloads <- payload_counts %>%
+  arrange(desc(Count)) %>%
+  slice(1:10)
+
+# Reorder factor levels based on payload count
+top_10_payloads$COUNTRY <- factor(top_10_payloads$COUNTRY, levels = rev(top_10_payloads$COUNTRY))
+
+# Calculate the maximum count for adjusting flag positions
+max_count <- max(top_10_payloads$Count)
+
+# Define breaks for the y-axis
+y_breaks <- pretty(range(top_10_payloads$Count), n = 10)
+
+p2 <- top_10_payloads %>%
+  mutate(code = tolower(COUNTRY)) %>% 
+  ggplot(aes(x = COUNTRY, y = Count)) +
+  geom_col(fill = "#7EB5D6", color = "black") +  # Change bar fill to light blue and outline color to black
+  geom_flag(aes(y = Count + max_count * 0.15, country = code), size = 10) +  # Adjust the y-coordinate of flags
+  geom_text(aes(label = Count, y =  Count + max_count * 0.022), vjust = -0.1, size = 3.5, color = "white") +  # Shift data labels slightly above the bars and set text color to white
+  scale_y_continuous(breaks = y_breaks) +  # Set breaks on y-axis
+  scale_x_discrete(labels = c("RU" = "Russia", "CN" = "China", "US" = "United States", "DE" = "Germany", "CA" = "Canada", "FR" = "France", "JP" = "Japan", "IN" = "India", "GB" = "United Kingdom", "EU" = "European Space Agency")) +
+  theme_minimal(base_size = 12) +  # Use a minimal theme for a cleaner look
+  theme(
+    plot.background = element_rect(fill = "black"),  # Change background to black
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, color = "white"),  # Rotate x-axis labels for readability and set text color to white
+    axis.text.y = element_text(color = "white"),  # Set y-axis text color to white
+    axis.title = element_text(color = "white"),  # Set axis title color to white
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5),  # Adjust plot margins as needed (top, right, bottom, left)
+    plot.title = element_blank()  # Remove plot title
+  ) +
+  labs(x = "Country of Origin", y = "Total Payload Count")
+
+# Display the modified plot
+print(p2)
+```
+
+**Description:**
+This dataset encompasses counts of both deorbited and in-orbit payloads, predominantly satellites, including parts and supplies for all space stations. Notably, USSR data points are not differentiated from Russian. The data, sourced from the www.space-track.org API, spans the years 1957 to 2023. 
+
+### Satellite Purposes by Year (2010-2022)
+```{r, echo=FALSE}
+all_purposes <- na.omit(unique(c(merged_data$Purpose, merged_data$`Detailed Purpose`)))
+
+# Define a function to handle the splitting and conditional checks
+process_purpose <- function(purpose) {
+  if (grepl("/", purpose)) {
+    split_strings <- unlist(strsplit(purpose, "/"))
+    # Use ifelse for a vectorized conditional check
+    split_strings <- sapply(split_strings, function(x) ifelse(grepl(",", x), x, x))
+    return(split_strings)
+  } else {
+    return(purpose)
+  }
+}
+
+# Apply the function to each element in the vector
+intermediate_strings <- unlist(lapply(all_purposes, process_purpose))
+
+# Remove any duplicates from the intermediate vector
+final_strings <- unique(intermediate_strings)
+
+# Iterate over each string in final_strings
+for (string in final_strings) {
+  # Remove any unwanted characters from the string to make it a valid column name
+  valid_column_name <- gsub("[^[:alnum:] ]", "", string)
+  valid_column_name <- gsub(" ", " ", valid_column_name)  # Replace spaces with underscores
+
+  # Add a new column to cleaned_data with the name based on the string, set all values to FALSE
+  merged_data[[valid_column_name]] <- FALSE
+}
+
+# Initialize an empty list to store the combined lists without NAs
+cleaned_data <- subset(merged_data, !is.na(Purpose))
+all_combined_lists <- list()
+
+for (x in 1:nrow(cleaned_data)) {
+    y_purpose <- as.character(cleaned_data[x, 'Purpose'])
+    y_detailed_purpose <- as.character(cleaned_data[x, 'Detailed Purpose'])
+    
+    # Check if y_purpose is NA, and if not, split and omit NAs
+    if (!is.na(y_purpose)) {
+        split_list1 <- na.omit(strsplit(y_purpose, split = "/")[[1]])
+    } else {
+        split_list1 <- character(0)  # Use an empty character vector if y_purpose is NA
+    }
+    
+    # Check if y_detailed_purpose is NA, and if not, split and omit NAs
+    if (!is.na(y_detailed_purpose)) {
+        split_list2 <- na.omit(strsplit(y_detailed_purpose, split = "/")[[1]])
+    } else {
+        split_list2 <- character(0)  # Use an empty character vector if y_detailed_purpose is NA
+    }
+    
+    # Combining both lists into one, excluding NA values
+    combined_list <- c(split_list1, split_list2)
+    
+    # Append the combined list to the 'all_combined_lists'
+    all_combined_lists[[x]] <- combined_list
+    for (z in combined_list){
+        cleaned_data[x,z] = TRUE
+    }
+}
+
+# Update "Automatic Identification System (AIS)" and "Meteorology" based on "Meteorology, Automatic Identification System (AIS)"
+cleaned_data <- cleaned_data %>%
+  mutate(
+    `Automatic Identification System (AIS)` = if_else(`Meteorology, Automatic Identification System (AIS)`, TRUE, `Automatic Identification System (AIS)`),
+    Meteorology = if_else(`Meteorology, Automatic Identification System (AIS)`, TRUE, Meteorology)
+  ) %>%
+  # Remove the "Meteorology, Automatic Identification System (AIS)" column
+  select(-`Meteorology, Automatic Identification System (AIS)`)
+                            
+cleaned_data$`AIS` <- cleaned_data$`Automatic Identification System (AIS)`
+cleaned_data$`Intelligence` <- cleaned_data$`Electronic Intelligence`
+
+                            
+cleaned_data <- cleaned_data %>%
+  mutate(`Optical Imaging` = `Optical` | `Optical Imaging`) %>%
+  select(-`Optical`) %>%
+  mutate(`Optical Imaging` = `Optical Stereo Imaging` | `Optical Imaging`) %>%
+  select(-`Optical Stereo Imaging`) %>%
+  mutate(`Optical Imaging` = `Optical Imaging (video)` | `Optical Imaging`) %>%
+  select(-`Optical Imaging (video)`) %>%
+  mutate(`Optical Imaging` = `Video Imaging` | `Optical Imaging`) %>%
+  select(-`Video Imaging`) %>%                                   
+  mutate(Radar = `Radar Surveillance` | Radar) %>%
+  select(-`Radar Surveillance`) %>%
+  mutate(Radar = `Synthetic Aperture Radar (SAR)` | Radar) %>%
+  select(-`Synthetic Aperture Radar (SAR)`) %>%
+  mutate(Radar = `Radar Imaging (SAR)` | Radar) %>%
+  select(-`Radar Imaging (SAR)`) %>%
+  mutate(Radar = `Radar Imaging` | Radar) %>%
+  select(-`Radar Imaging`) %>%
+  mutate(`Radio Frequency Monitoring` = `Radio Spectrum Monitoring` | `Radio Frequency Monitoring`) %>%
+  select(-`Radio Spectrum Monitoring`) %>%                            
+  mutate(`Meteorology` = `Meteorological` | `Meteorology`) %>%
+  select(-`Meteorological`) %>%
+  mutate(`Meteorology` = `Meterology` | `Meteorology`) %>%
+  select(-`Meterology`) %>%
+  mutate(`Earth Science` = `Earth` | `Earth Science`) %>%
+  select(-`Automatic Identification System (AIS)`) %>%
+  select(-`Electronic Intelligence`) %>%
+
+  #select(-`Communications`) %>%                             
+  select(-`Earth`)  
+
+# Convert the specified columns to logical
+cleaned_data <- cleaned_data %>%
+  mutate(across(61:length(names(cleaned_data)), ~ as.logical(.)))
+
+# Assuming cleaned_data and the previous steps are defined as you've shown
+
+# Pivot the data into a long format, filter TRUE values, and summarize
+relevant_data <- cleaned_data %>%
+  select(Launch_Year, 61:length(names(cleaned_data))) %>%
+  pivot_longer(-Launch_Year, names_to = "Category", values_to = "Value") %>%
+  filter(Value == TRUE) %>%
+  group_by(Launch_Year, Category) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# Determine the top categories based on total count
+top_categories <- relevant_data %>%
+  group_by(Category) %>%
+  summarise(TotalCount = sum(Count)) %>%
+  top_n(12, TotalCount) %>%
+  pull(Category)
+
+# Filter the data to include only the years from 2010 to 2022
+filtered_data <- relevant_data %>%
+  filter(as.numeric(Launch_Year) >= 2010, as.numeric(Launch_Year) <= 2022)
+
+# Label categories not in 'top_categories' as 'Other'
+filtered_data <- filtered_data %>%
+  mutate(Category = if_else(Category %in% top_categories, Category, 'Other'))
+
+# Reorder 'Category' based on the sum of 'Count' across all years
+# Note: This step may need adjustment as 'Other' might aggregate a significant count
+filtered_data <- filtered_data %>%
+  group_by(Category) %>%
+  mutate(TotalCount = sum(Count)) %>%
+  ungroup() %>%
+  mutate(Category = reorder(Category, TotalCount)) %>%
+  mutate(Category = fct_rev(Category)) %>%  # Reverse the factor levels
+  select(-TotalCount)  # Remove the 'TotalCount' column as it's no longer needed
+
+# Define the complete color palette for all categories
+color_palette <- c(
+  "AIS" = "#66C2A5",
+  "Communications" = "#FC8D62",
+  "Earth Observation" = "#8DA0CB",
+  "Earth Science" = "#E78AC3",
+  "Intelligence" = "#A6D854",
+  "Global Positioning" = "#FFD92F",
+  "Meteorology" = "#E5C494",
+  "Navigation" = "#B3B3B3",
+  "Optical Imaging" = "#FFFD43",
+  "Technology Development" = "#9E0142"
+)
+
+year_range <- range(filtered_data$Launch_Year)
+year_breaks <- seq(from = year_range[1], to = year_range[2], by = 2)
+
+# Plot for "Communications"
+# Plot for "Communications"
+comm_plot <- ggplot(filter(filtered_data, Category == "Communications"), aes(x = Launch_Year, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = color_palette["Communications"]) +
+  theme(axis.title.x = element_blank(),
+        axis.title.x.bottom = element_blank(),
+        axis.text.x = element_blank(),  # Remove x-axis text
+        axis.ticks.x = element_blank(), # Remove x-axis ticks
+        plot.margin = unit(c(1, 1, 0.5, 1), "lines"),
+    plot.background = element_rect(fill = "black"),  # Change background to black
+    text = element_text(color = "white"),  # Change text color to white
+    axis.text = element_text(color = "white")# Change axis text color to white
+  )+
+  scale_y_continuous(name = " ",
+    breaks = seq(0, max(filtered_data$Count[filtered_data$Category == "Communications"]), by = 400))+
+  scale_x_continuous(breaks = year_breaks, labels = year_breaks)+
+  labs(x = "", y = " ", fill = "Category", title = "") + # Remove the title
+  theme(legend.position = "none")
+
+filtered_data2 <- filtered_data
+filtered_data2$Count[filtered_data2$Category == "Communications"] <- 0
+max_sum_per_year <- filtered_data2 %>%
+  group_by(Launch_Year) %>%
+  summarize(Total_Count = sum(Count, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarize(Max_Sum = max(Total_Count, na.rm = TRUE)) %>%
+  pull(Max_Sum)
+
+other_plot <- ggplot(filtered_data2, aes(x = Launch_Year, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_manual(values = color_palette) +
+  theme(
+    plot.background = element_rect(fill = "black"),  # Change background to black
+    text = element_text(color = "white"),  # Change text color to white
+    legend.text = element_text(color = "white"),  # Change legend text color to white
+    legend.title = element_text(color = "white"),  # Change legend title color to white
+    legend.background = element_rect(fill = "black"),  # Change legend background to black
+    axis.text = element_text(color = "white"),  # Change axis text color to white
+    axis.title = element_text(color = "white")  # Change axis title color to white
+  ) +
+  scale_y_continuous(name = "Number of Satellites",breaks = seq(0, max_sum_per_year, by = 100))+
+  scale_x_continuous(breaks = year_breaks, labels = year_breaks)+
+  labs(x = "Launch Year", y = "Number of Satellites", fill = "Category", title = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+
+# Combine the plots with comm_plot on top
+combined_plot <- comm_plot + other_plot + plot_layout(ncol = 1)
+
+# Apply a simple theme adjustment to the combined plot
+combined_plot <- combined_plot + guides(fill = guide_legend(ncol = 3)) +
+  theme(
+    panel.border = element_blank()  # Remove panel borders
+  )
+
+# Display the combined plot
+print(combined_plot)
+```
+
+**Description:**
+Each bar represents the number of satellites launched in a given year, categorized by their purposes. Some satellites serve multiple functions and are counted accordingly. For clarification, "Intelligence Earth Science" refers to scientific research conducted in space concerning Earth, as opposed to space science, which constitutes a separate category. "AIS" stands for Automatic Identification System. This data is sourced from the www.space-track.org API.
+
+### Total Rocket Launch Counts by Location (1957-2024)
+```{r, echo=FALSE}
+launches <- read.csv("launches.csv")
+times <- numeric()
+for (x in launches$Net){
+    split_string <- strsplit(x, " ")
+    split_string <- strsplit(split_string[[1]][1],'/')
+    split_string <- as.numeric(split_string[[1]][3])
+    times <- c(times, split_string)
+}
+launches$Year <- times
+launches <- subset(launches, Status != "TBA")
+#launches <- subset(launches, Status == "Launch Failure")
+
+places <- c()
+for (x in launches$Pad){
+    split_string <- strsplit(x, "|", fixed = TRUE)[[1]]
+    trimmed_string <- trimws(split_string)
+    final_string <- gsub("\\s+", " ", trimmed_string)[2]
+    places <- c(places, final_string)
+}
+launches$places <- places
+
+uniqueplaces <- unique(launches$places)
+
+latitudes <- c(45.965, 28.396837, NA, 34.751330, 37.883255, 48.5828, 
+               33.677267, 30.778056, 62.925644, 31.2523, -2.938333, 
+               28.573469, -30.955278, 5.239, 40.9547, 30.4, 13.7330, 
+               28.240944, 38.8597, 31.884444, NA, 51.699997, -2.370497, 
+               NA, 40.8570, 57.435833, 9.048167, 50.8, 35.258333, 
+               34.431944, 39.660, 31.422927, 22.02278, 51.884318, 19.6164, 
+               -39.261009, 30.400115, 32.990278, 25.9875, 36.200646, 
+               -34.91, -12.390556, 37.096944, 33.099331)
+
+# Longitudes
+longitudes <- c(63.305, -80.605659, NA, -120.52023, -75.439339, 46.1141, 
+                -106.475417, 3.053889, 40.577878, 131.0785, 40.2125, 
+                -80.651070, 136.532222, -52.768, 100.2883, 130.97, 80.2350, 
+                102.022600, 111.5907, 34.680278, NA, 128.0, -44.391164, 
+                NA, 129.6665, -152.337778, 167.743086, 59.516669, 53.954722, 
+                127.535000, 124.705, -104.757152, -159.785, 128.334832, 110.9534, 
+                177.865297, 130.974025, 106.969167, 97.186389, 55.333933, 
+                135.65, 136.795167, 6.738611, 126.604620)
+
+# Create a data frame with places and their coordinates
+coordinates_df <- data.frame(Place = uniqueplaces, Latitude = latitudes, Longitude = longitudes)
+names(launches)[names(launches) == "places"] <- "Place"
+launches <- merge(launches, coordinates_df, by = "Place", all.x = TRUE)
+launches <- launches[complete.cases(launches$Latitude), ]
+
+# Assuming 'launches' is already defined with columns: Latitude, Longitude, Place, Year
+
+launches_counts <- launches %>%
+  group_by(Latitude, Longitude, Place) %>%
+  summarise(count = n(),
+            years_active = paste(range(Year), collapse = " - "),
+            .groups = "drop")  # Drop the grouping
+
+# Scaling factor setup
+min_radius <- 5  # Minimum radius for circles
+max_radius <- 20  # Maximum radius for circles
+
+# Calculate maximum and minimum counts
+max_count <- max(launches_counts$count)
+min_count <- min(launches_counts$count)
+range_count <- max_count - min_count
+
+# Adjust the scaling factor to account for count range
+scaling_factor <- (max_radius - min_radius) / range_count
+
+# Define custom breaks for coloring and legend
+custom_breaks <- c(1, 10, 50, 100, 300, Inf)  # Manually set breaks, Inf indicates '>300'
+
+# Define color palette and labels for the legend
+num_colors <- length(custom_breaks) - 1
+color_palette <- c("blue", "green", "yellow", "orange", "red")[1:num_colors]
+labels <- c("< 10", "< 50", "< 100", "< 300", "300+")
+
+# Function to determine color based on count
+get_color <- function(count) {
+  findInterval(count, custom_breaks, all.inside = TRUE)
+}
+
+# Create map with scaled circle markers and dynamic coloring
+map <- leaflet(launches_counts) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lat = ~Latitude,
+    lng = ~Longitude,
+    radius = ~min_radius + (count - min_count) * scaling_factor, # Updated radius calculation
+    fillOpacity = 0.7,
+    color = ~color_palette[get_color(count)],
+    stroke = FALSE,
+    popup = ~paste("Place:", Place, 
+                   "<br>Total Launches:", count,
+                   "<br>Years Active:", years_active)
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    title = "Launch Count",
+    labels = labels,
+    colors = color_palette,
+    opacity = 0.7
+  )
+
+# Display the map
+map
+```
+
+**Description:**
+This map displays all launch sites for rockets dating back to 1957, encompassing launches from both governmental and private entities, including unsuccessful ones. Excluded are launches conducted at sea without GPS information or airborne launches aided by planes. The color and size of each point correspond to the number of launches, with the option to access detailed information about each site, including location, exact launch count, and years of activity. It's important to note that many launches deploy multiple satellites, contributing to observed discrepancies. This data is scraped from the Space Launch Now Database (https://spacelaunchnow.me/launch/)
